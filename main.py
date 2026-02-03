@@ -11,7 +11,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")  # например "-1001234567890"
 API_KEY = os.getenv("API_KEY")              # например "lfdfq"
 
-# Разрешаем запросы ТОЛЬКО с вашего Vercel-домена
+#а Разрешаем запросы ТОЛЬКО с вашего Vercel-домена
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://ret-ashy.vercel.app"],
