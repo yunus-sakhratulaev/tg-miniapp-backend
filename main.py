@@ -1,16 +1,53 @@
-# This is a sample Python script.
+import os
+import httpx
+from fastapi import FastAPI, Header, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
-# Press Shift+F10 to execute it or replace it with your code.
-# Press Double Shift to search everywhere for classes, files, tool windows, actions, and settings.
+app = FastAPI()
 
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")
+API_KEY = os.getenv("API_KEY")
 
-def print_hi(name):
-    # Use a breakpoint in the code line below to debug your script.
-    print(f'Hi, {name}')  # Press Ctrl+F8 to toggle the breakpoint.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
+class Payload(BaseModel):
+    text: str
 
-# Press the green button in the gutter to run the script.
-if __name__ == '__main__':
-    print_hi('PyCharm')
+@app.get("/")
+def root():
+    return {"ok": True, "service": "tg-miniapp-backend"}
 
-# See PyCharm help at https://www.jetbrains.com/help/pycharm/
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+@app.post("/api/send")
+async def api_send(payload: Payload, x_api_key: str | None = Header(default=None)):
+    if not BOT_TOKEN or not GROUP_CHAT_ID:
+        raise HTTPException(500, "BOT_TOKEN / GROUP_CHAT_ID not set")
+
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(401, "Bad API key")
+
+    text = payload.text.strip()
+    if not text:
+        raise HTTPException(400, "Empty text")
+
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    body = {"chat_id": GROUP_CHAT_ID, "text": text}
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.post(url, json=body)
+        data = r.json()
+
+    if not data.get("ok"):
+        raise HTTPException(500, data)
+
+    return {"ok": True}
