@@ -6,25 +6,19 @@ from pydantic import BaseModel
 
 app = FastAPI()
 
-# Берём из Railway → Variables
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")  # например "-1001234567890"
+GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")  # "-100..."
 API_KEY = os.getenv("API_KEY")              # например "lfdfq"
 
-#а Разрешаем запросы ТОЛЬКО с вашего Vercel-домена
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://ret-ashy.vercel.app"],
-    allow_methods=["POST", "GET", "OPTIONS"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
 class Payload(BaseModel):
     text: str
-
-@app.get("/")
-def root():
-    return {"ok": True, "service": "tg-miniapp-backend"}
 
 @app.get("/health")
 def health():
@@ -35,7 +29,6 @@ async def api_send(payload: Payload, x_api_key: str | None = Header(default=None
     if not BOT_TOKEN or not GROUP_CHAT_ID:
         raise HTTPException(status_code=500, detail="BOT_TOKEN / GROUP_CHAT_ID not set")
 
-    # Примитивная защита ключом
     if API_KEY and x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Bad API key")
 
