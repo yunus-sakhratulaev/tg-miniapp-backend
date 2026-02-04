@@ -302,4 +302,13 @@ async def telegram_webhook(
             except Exception:
                 pass
 
+    from sqlalchemy import text
+
+    @app.get("/db/ping")
+    async def db_ping():
+        session = await get_session()
+        async with session:
+            result = await session.execute(text("SELECT 1"))
+            return {"db": "ok", "value": result.scalar_one()}
+
     return {"ok": True}
