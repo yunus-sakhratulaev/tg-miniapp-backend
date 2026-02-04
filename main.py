@@ -7,7 +7,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from sqlalchemy import String, Integer, Text, Boolean, DateTime
+from sqlalchemy import String, Integer, Text, Boolean, DateTime, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 
@@ -42,9 +42,7 @@ class Base(DeclarativeBase):
 class Order(Base):
     __tablename__ = "orders"
 
-    # твой короткий id (uuid hex[:10])
     order_id: Mapped[str] = mapped_column(String(32), primary_key=True)
-
     buyer_id: Mapped[int] = mapped_column(Integer, nullable=False)
     text: Mapped[str] = mapped_column(Text, nullable=False)
 
@@ -127,9 +125,19 @@ class OrderPayload(BaseModel):
     buyer_id: int
 
 
+# ================== HEALTH ==================
 @app.get("/health")
 def health():
     return {"ok": True}
+
+
+# ================== DB PING ==================
+@app.get("/db/ping")
+async def db_ping():
+    session = await get_session()
+    async with session:
+        result = await session.execute(text("SELECT 1"))
+        return {"db": "ok", "value": result.scalar_one()}
 
 
 # ================== SETTINGS HELPERS ==================
@@ -158,15 +166,15 @@ async def create_order(payload: OrderPayload, x_api_key: str | None = Header(def
     if not GROUP_CHAT_ID:
         raise HTTPException(500, detail="GROUP_CHAT_ID not set")
 
-    text = payload.text.strip()
-    if not text:
+    text_value = payload.text.strip()
+    if not text_value:
         raise HTTPException(400, detail="Empty text")
 
     order_id = uuid.uuid4().hex[:10]
 
     session = await get_session()
     async with session:
-        session.add(Order(order_id=order_id, buyer_id=payload.buyer_id, text=text))
+        session.add(Order(order_id=order_id, buyer_id=payload.buyer_id, text=text_value))
         await session.commit()
 
     keyboard = {
@@ -177,7 +185,7 @@ async def create_order(payload: OrderPayload, x_api_key: str | None = Header(def
 
     await tg_call("sendMessage", {
         "chat_id": GROUP_CHAT_ID,
-        "text": f"{text}\n\n🆔 Заказ: {order_id}",
+        "text": f"{text_value}\n\n🆔 Заказ: {order_id}",
         "reply_markup": keyboard
     })
 
@@ -199,10 +207,10 @@ async def telegram_webhook(
     msg = update.get("message")
     if msg:
         chat_id = msg.get("chat", {}).get("id")
-        text = (msg.get("text") or "").strip()
+        text_in = (msg.get("text") or "").strip()
         from_id = msg.get("from", {}).get("id")
 
-        if GROUP_CHAT_ID and chat_id == int(GROUP_CHAT_ID) and text.startswith("/pay"):
+        if GROUP_CHAT_ID and chat_id == int(GROUP_CHAT_ID) and text_in.startswith("/pay"):
             if from_id not in ADMIN_IDS:
                 await tg_call("sendMessage", {
                     "chat_id": chat_id,
@@ -210,7 +218,7 @@ async def telegram_webhook(
                 })
                 return {"ok": True}
 
-            new_text = text[len("/pay"):].strip()
+            new_text = text_in[len("/pay"):].strip()
             if not new_text:
                 await tg_call("sendMessage", {
                     "chat_id": chat_id,
@@ -301,14 +309,5 @@ async def telegram_webhook(
                 })
             except Exception:
                 pass
-
-    from sqlalchemy import text
-
-    @app.get("/db/ping")
-    async def db_ping():
-        session = await get_session()
-        async with session:
-            result = await session.execute(text("SELECT 1"))
-            return {"db": "ok", "value": result.scalar_one()}
 
     return {"ok": True}
