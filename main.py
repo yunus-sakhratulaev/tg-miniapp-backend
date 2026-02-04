@@ -31,9 +31,9 @@ WEBAPP_URL = os.getenv("WEBAPP_URL", "https://ret-ashy.vercel.app")
 # Разрешаем запросы с фронта
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://ret-ashy.vercel.app"],
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
