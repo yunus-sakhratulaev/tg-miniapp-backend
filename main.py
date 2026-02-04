@@ -17,18 +17,17 @@ app = FastAPI()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")
-API_KEY = os.getenv("API_KEY")
+API_KEY = os.getenv("API_KEY")  # секрет между Vercel proxy и Railway
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
 ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "")
 ADMIN_IDS = {int(x.strip()) for x in ADMIN_IDS_RAW.split(",") if x.strip().isdigit()}
 
 DATABASE_URL = os.getenv("DATABASE_URL")
-
-# URL мини-приложения (Vercel). Можно переопределить через Railway Variables: WEBAPP_URL
 WEBAPP_URL = os.getenv("WEBAPP_URL", "https://ret-ashy.vercel.app")
 
-# Разрешаем запросы с фронта
+# CORS тут можно оставить либерально.
+# Telegram иногда ломает кросс-доменные fetch, поэтому основная ставка — Vercel proxy.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -68,12 +67,6 @@ class Setting(Base):
 
 
 def _to_async_db_url(url: str) -> str:
-    """
-    Railway часто даёт:
-      postgresql://...
-    А SQLAlchemy async должен быть:
-      postgresql+asyncpg://...
-    """
     if url.startswith("postgresql+asyncpg://"):
         return url
     if url.startswith("postgres://"):
@@ -100,9 +93,6 @@ async def get_session() -> AsyncSession:
 
 @app.on_event("startup")
 async def startup():
-    """
-    При старте создаём таблицы (если их нет).
-    """
     if engine is None:
         return
     async with engine.begin() as conn:
@@ -136,13 +126,11 @@ class OrderPayload(BaseModel):
     buyer_id: int
 
 
-# ================== HEALTH ==================
 @app.get("/health")
 def health():
     return {"ok": True}
 
 
-# ================== DB PING ==================
 @app.get("/db/ping")
 async def db_ping():
     session = await get_session()
@@ -169,11 +157,13 @@ async def set_payment_text(session: AsyncSession, value: str) -> None:
     await session.commit()
 
 
-# ================== CREATE ORDER (mini app -> backend -> group chat) ==================
+# ================== CREATE ORDER ==================
 @app.post("/api/order")
 async def create_order(payload: OrderPayload, x_api_key: str | None = Header(default=None)):
+    # Важно: ключ теперь держим НЕ в браузере, а на Vercel (proxy добавляет X-API-Key)
     if API_KEY and x_api_key != API_KEY:
         raise HTTPException(401, detail="Bad API key")
+
     if not GROUP_CHAT_ID:
         raise HTTPException(500, detail="GROUP_CHAT_ID not set")
 
@@ -214,14 +204,13 @@ async def telegram_webhook(
 
     update = await req.json()
 
-    # 1) Сообщения (команды)
+    # 1) Commands
     msg = update.get("message")
     if msg:
         chat_id = msg.get("chat", {}).get("id")
         text_in = (msg.get("text") or "").strip()
         from_id = msg.get("from", {}).get("id")
 
-        # /start или /menu -> показываем кнопку магазина
         if text_in.startswith("/start") or text_in.startswith("/menu"):
             await tg_call("sendMessage", {
                 "chat_id": chat_id,
@@ -230,7 +219,6 @@ async def telegram_webhook(
             })
             return {"ok": True}
 
-        # /pay <текст> -> сохранить реквизиты (только для админов и только в группе)
         if GROUP_CHAT_ID and chat_id == int(GROUP_CHAT_ID) and text_in.startswith("/pay"):
             if from_id not in ADMIN_IDS:
                 await tg_call("sendMessage", {
@@ -259,7 +247,7 @@ async def telegram_webhook(
 
         return {"ok": True}
 
-    # 2) Callback кнопок
+    # 2) Callback buttons
     cb = update.get("callback_query")
     if not cb:
         return {"ok": True}
@@ -271,7 +259,6 @@ async def telegram_webhook(
     message_id = message.get("message_id")
     chat = message.get("chat", {})
 
-    # убрать "часики"
     try:
         await tg_call("answerCallbackQuery", {"callback_query_id": cb_id})
     except Exception:
@@ -283,10 +270,7 @@ async def telegram_webhook(
         session = await get_session()
         async with session:
             order = await session.get(Order, order_id)
-            if not order:
-                return {"ok": True}
-
-            if order.accepted:
+            if not order or order.accepted:
                 return {"ok": True}
 
             accepter = (
@@ -314,17 +298,14 @@ async def telegram_webhook(
             "text": f"✅ Заказ {order_id} принят: {accepter}\n\n💳 Реквизиты:\n{payment_text}"
         })
 
-        # покупателю в личку
         try:
             await tg_call("sendMessage", {
                 "chat_id": order.buyer_id,
                 "text": f"✅ Ваш заказ {order_id} принят.\n\n💳 Реквизиты для оплаты:\n{payment_text}"
             })
         except Exception:
-            # если buyer_id неверный или бот не может написать — не падаем
             pass
 
-        # заменить кнопку
         if message_id:
             try:
                 await tg_call("editMessageReplyMarkup", {
