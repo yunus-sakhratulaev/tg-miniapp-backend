@@ -12,12 +12,11 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 
 
-# ================== APP ==================
 app = FastAPI()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")
-API_KEY = os.getenv("API_KEY")  # секрет между Vercel proxy и Railway
+API_KEY = os.getenv("API_KEY")              # секрет только между Vercel -> Railway
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
 ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "")
@@ -26,8 +25,6 @@ ADMIN_IDS = {int(x.strip()) for x in ADMIN_IDS_RAW.split(",") if x.strip().isdig
 DATABASE_URL = os.getenv("DATABASE_URL")
 WEBAPP_URL = os.getenv("WEBAPP_URL", "https://ret-ashy.vercel.app")
 
-# CORS тут можно оставить либерально.
-# Telegram иногда ломает кросс-доменные fetch, поэтому основная ставка — Vercel proxy.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -37,7 +34,7 @@ app.add_middleware(
 )
 
 
-# ================== DB (PostgreSQL) ==================
+# ================== DB ==================
 class Base(DeclarativeBase):
     pass
 
@@ -61,7 +58,6 @@ class Order(Base):
 
 class Setting(Base):
     __tablename__ = "settings"
-
     key: Mapped[str] = mapped_column(String(100), primary_key=True)
     value: Mapped[str] = mapped_column(Text, nullable=False)
 
@@ -120,7 +116,6 @@ def webapp_keyboard():
     }
 
 
-# ================== API MODELS ==================
 class OrderPayload(BaseModel):
     text: str
     buyer_id: int
@@ -135,11 +130,18 @@ def health():
 async def db_ping():
     session = await get_session()
     async with session:
-        result = await session.execute(text("SELECT 1"))
-        return {"db": "ok", "value": result.scalar_one()}
+        r = await session.execute(text("SELECT 1"))
+        return {"db": "ok", "value": r.scalar_one()}
 
 
-# ================== SETTINGS HELPERS ==================
+@app.post("/debug/echo")
+async def debug_echo(req: Request):
+    return {
+        "headers": dict(req.headers),
+        "body": await req.json()
+    }
+
+
 PAYMENT_KEY = "payment_text"
 
 
@@ -157,13 +159,10 @@ async def set_payment_text(session: AsyncSession, value: str) -> None:
     await session.commit()
 
 
-# ================== CREATE ORDER ==================
 @app.post("/api/order")
 async def create_order(payload: OrderPayload, x_api_key: str | None = Header(default=None)):
-    # Важно: ключ теперь держим НЕ в браузере, а на Vercel (proxy добавляет X-API-Key)
     if API_KEY and x_api_key != API_KEY:
         raise HTTPException(401, detail="Bad API key")
-
     if not GROUP_CHAT_ID:
         raise HTTPException(500, detail="GROUP_CHAT_ID not set")
 
@@ -178,11 +177,7 @@ async def create_order(payload: OrderPayload, x_api_key: str | None = Header(def
         session.add(Order(order_id=order_id, buyer_id=payload.buyer_id, text=text_value))
         await session.commit()
 
-    keyboard = {
-        "inline_keyboard": [[
-            {"text": "✅ Принять заказ", "callback_data": f"accept:{order_id}"}
-        ]]
-    }
+    keyboard = {"inline_keyboard": [[{"text": "✅ Принять заказ", "callback_data": f"accept:{order_id}"}]]}
 
     await tg_call("sendMessage", {
         "chat_id": GROUP_CHAT_ID,
@@ -193,7 +188,6 @@ async def create_order(payload: OrderPayload, x_api_key: str | None = Header(def
     return {"ok": True, "order_id": order_id}
 
 
-# ================== TELEGRAM WEBHOOK ==================
 @app.post("/telegram/webhook")
 async def telegram_webhook(
     req: Request,
@@ -204,7 +198,6 @@ async def telegram_webhook(
 
     update = await req.json()
 
-    # 1) Commands
     msg = update.get("message")
     if msg:
         chat_id = msg.get("chat", {}).get("id")
@@ -221,33 +214,23 @@ async def telegram_webhook(
 
         if GROUP_CHAT_ID and chat_id == int(GROUP_CHAT_ID) and text_in.startswith("/pay"):
             if from_id not in ADMIN_IDS:
-                await tg_call("sendMessage", {
-                    "chat_id": chat_id,
-                    "text": "⛔ Нет прав менять реквизиты."
-                })
+                await tg_call("sendMessage", {"chat_id": chat_id, "text": "⛔ Нет прав менять реквизиты."})
                 return {"ok": True}
 
             new_text = text_in[len("/pay"):].strip()
             if not new_text:
-                await tg_call("sendMessage", {
-                    "chat_id": chat_id,
-                    "text": "Напиши так:\n/pay\nКарта: ...\nСБП: ..."
-                })
+                await tg_call("sendMessage", {"chat_id": chat_id, "text": "Напиши так:\n/pay\nКарта: ...\nСБП: ..."})
                 return {"ok": True}
 
             session = await get_session()
             async with session:
                 await set_payment_text(session, new_text)
 
-            await tg_call("sendMessage", {
-                "chat_id": chat_id,
-                "text": "✅ Реквизиты сохранены."
-            })
+            await tg_call("sendMessage", {"chat_id": chat_id, "text": "✅ Реквизиты сохранены."})
             return {"ok": True}
 
         return {"ok": True}
 
-    # 2) Callback buttons
     cb = update.get("callback_query")
     if not cb:
         return {"ok": True}
@@ -273,12 +256,7 @@ async def telegram_webhook(
             if not order or order.accepted:
                 return {"ok": True}
 
-            accepter = (
-                f"@{from_user.get('username')}"
-                if from_user.get("username")
-                else (from_user.get("first_name") or "Пользователь")
-            )
-
+            accepter = f"@{from_user.get('username')}" if from_user.get("username") else (from_user.get("first_name") or "Пользователь")
             payment_text = await get_payment_text(session)
 
             order.accepted = True
@@ -288,8 +266,7 @@ async def telegram_webhook(
         if not payment_text:
             await tg_call("sendMessage", {
                 "chat_id": GROUP_CHAT_ID,
-                "text": f"⚠️ Заказ {order_id} принят: {accepter}\n"
-                        f"Но реквизиты не заданы.\nАдмин: /pay <текст>"
+                "text": f"⚠️ Заказ {order_id} принят: {accepter}\nНо реквизиты не заданы.\nАдмин: /pay <текст>"
             })
             return {"ok": True}
 
@@ -311,9 +288,7 @@ async def telegram_webhook(
                 await tg_call("editMessageReplyMarkup", {
                     "chat_id": chat.get("id"),
                     "message_id": message_id,
-                    "reply_markup": {
-                        "inline_keyboard": [[{"text": "✅ Принято", "callback_data": "noop"}]]
-                    }
+                    "reply_markup": {"inline_keyboard": [[{"text": "✅ Принято", "callback_data": "noop"}]]}
                 })
             except Exception:
                 pass
