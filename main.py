@@ -25,10 +25,14 @@ ADMIN_IDS = {int(x.strip()) for x in ADMIN_IDS_RAW.split(",") if x.strip().isdig
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Разрешаем запросы с фронта Vercel
+# URL мини-приложения (Vercel). Можно переопределить через Railway Variables: WEBAPP_URL
+WEBAPP_URL = os.getenv("WEBAPP_URL", "https://ret-ashy.vercel.app")
+
+# Разрешаем запросы с фронта
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://ret-ashy.vercel.app"],
+    allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
@@ -98,7 +102,6 @@ async def get_session() -> AsyncSession:
 async def startup():
     """
     При старте создаём таблицы (если их нет).
-    Для первого опыта это проще всего.
     """
     if engine is None:
         return
@@ -117,6 +120,14 @@ async def tg_call(method: str, payload: dict):
     if not data.get("ok"):
         raise HTTPException(500, detail=data)
     return data["result"]
+
+
+def webapp_keyboard():
+    return {
+        "inline_keyboard": [[
+            {"text": "🌹 Открыть магазин", "web_app": {"url": WEBAPP_URL}}
+        ]]
+    }
 
 
 # ================== API MODELS ==================
@@ -149,12 +160,12 @@ async def get_payment_text(session: AsyncSession) -> str:
     return row.value if row else ""
 
 
-async def set_payment_text(session: AsyncSession, text: str) -> None:
+async def set_payment_text(session: AsyncSession, value: str) -> None:
     row = await session.get(Setting, PAYMENT_KEY)
     if row:
-        row.value = text
+        row.value = value
     else:
-        session.add(Setting(key=PAYMENT_KEY, value=text))
+        session.add(Setting(key=PAYMENT_KEY, value=value))
     await session.commit()
 
 
@@ -203,13 +214,23 @@ async def telegram_webhook(
 
     update = await req.json()
 
-    # 1) Админ задаёт реквизиты: /pay <текст>
+    # 1) Сообщения (команды)
     msg = update.get("message")
     if msg:
         chat_id = msg.get("chat", {}).get("id")
         text_in = (msg.get("text") or "").strip()
         from_id = msg.get("from", {}).get("id")
 
+        # /start или /menu -> показываем кнопку магазина
+        if text_in.startswith("/start") or text_in.startswith("/menu"):
+            await tg_call("sendMessage", {
+                "chat_id": chat_id,
+                "text": "Нажми кнопку ниже, чтобы открыть магазин:",
+                "reply_markup": webapp_keyboard()
+            })
+            return {"ok": True}
+
+        # /pay <текст> -> сохранить реквизиты (только для админов и только в группе)
         if GROUP_CHAT_ID and chat_id == int(GROUP_CHAT_ID) and text_in.startswith("/pay"):
             if from_id not in ADMIN_IDS:
                 await tg_call("sendMessage", {
@@ -238,7 +259,7 @@ async def telegram_webhook(
 
         return {"ok": True}
 
-    # 2) Нажатие “Принять заказ”
+    # 2) Callback кнопок
     cb = update.get("callback_query")
     if not cb:
         return {"ok": True}
@@ -250,7 +271,7 @@ async def telegram_webhook(
     message_id = message.get("message_id")
     chat = message.get("chat", {})
 
-    # чтобы убрать "часики" на кнопке
+    # убрать "часики"
     try:
         await tg_call("answerCallbackQuery", {"callback_query_id": cb_id})
     except Exception:
@@ -293,11 +314,17 @@ async def telegram_webhook(
             "text": f"✅ Заказ {order_id} принят: {accepter}\n\n💳 Реквизиты:\n{payment_text}"
         })
 
-        await tg_call("sendMessage", {
-            "chat_id": order.buyer_id,
-            "text": f"✅ Ваш заказ {order_id} принят.\n\n💳 Реквизиты для оплаты:\n{payment_text}"
-        })
+        # покупателю в личку
+        try:
+            await tg_call("sendMessage", {
+                "chat_id": order.buyer_id,
+                "text": f"✅ Ваш заказ {order_id} принят.\n\n💳 Реквизиты для оплаты:\n{payment_text}"
+            })
+        except Exception:
+            # если buyer_id неверный или бот не может написать — не падаем
+            pass
 
+        # заменить кнопку
         if message_id:
             try:
                 await tg_call("editMessageReplyMarkup", {
