@@ -3,7 +3,8 @@ import uuid
 from datetime import datetime, timezone
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from sqlalchemy import String, Integer, Text, Boolean, DateTime, text
@@ -16,12 +17,27 @@ app = FastAPI()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
-DATABASE_URL = os.getenv("DATABASE_URL")
+
+# Если хочешь защиту: задай API_KEY на Railway и передавай его из прокси (не из браузера!)
+API_KEY = os.getenv("API_KEY")
 
 ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "")
 ADMIN_IDS = {int(x.strip()) for x in ADMIN_IDS_RAW.split(",") if x.strip().isdigit()}
 
+DATABASE_URL = os.getenv("DATABASE_URL")
+
 WEBAPP_URL = os.getenv("WEBAPP_URL", "https://ret-ashy.vercel.app")
+
+# CORS (по идее не нужен при прокси), но оставим разрешение для Vercel
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://ret-ashy.vercel.app",
+    ],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # ================== DB ==================
@@ -31,11 +47,14 @@ class Base(DeclarativeBase):
 
 class Order(Base):
     __tablename__ = "orders"
+
     order_id: Mapped[str] = mapped_column(String(32), primary_key=True)
     buyer_id: Mapped[int] = mapped_column(Integer, nullable=False)
     text: Mapped[str] = mapped_column(Text, nullable=False)
+
     accepted: Mapped[bool] = mapped_column(Boolean, default=False)
     accepted_by: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
@@ -61,6 +80,7 @@ def _to_async_db_url(url: str) -> str:
 
 engine = None
 SessionLocal = None
+
 if DATABASE_URL:
     engine = create_async_engine(_to_async_db_url(DATABASE_URL), echo=False)
     SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
@@ -97,12 +117,13 @@ def webapp_keyboard():
     return {"inline_keyboard": [[{"text": "🌹 Открыть магазин", "web_app": {"url": WEBAPP_URL}}]]}
 
 
-# ================== API ==================
+# ================== API MODELS ==================
 class OrderPayload(BaseModel):
     text: str
     buyer_id: int
 
 
+# ================== HEALTH / DB ==================
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -116,8 +137,31 @@ async def db_ping():
         return {"db": "ok", "value": r.scalar_one()}
 
 
+# ================== SETTINGS ==================
+PAYMENT_KEY = "payment_text"
+
+
+async def get_payment_text(session: AsyncSession) -> str:
+    row = await session.get(Setting, PAYMENT_KEY)
+    return row.value if row else ""
+
+
+async def set_payment_text(session: AsyncSession, value: str) -> None:
+    row = await session.get(Setting, PAYMENT_KEY)
+    if row:
+        row.value = value
+    else:
+        session.add(Setting(key=PAYMENT_KEY, value=value))
+    await session.commit()
+
+
+# ================== CREATE ORDER ==================
 @app.post("/api/order")
-async def create_order(payload: OrderPayload):
+async def create_order(payload: OrderPayload, x_api_key: str | None = Header(default=None)):
+    # если API_KEY задан — проверяем
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(401, detail="Bad API key")
+
     if not GROUP_CHAT_ID:
         raise HTTPException(500, detail="GROUP_CHAT_ID not set")
 
@@ -145,13 +189,21 @@ async def create_order(payload: OrderPayload):
 
 # ================== WEBHOOK ==================
 @app.post("/telegram/webhook")
-async def telegram_webhook(req: Request):
+async def telegram_webhook(
+    req: Request,
+    x_telegram_bot_api_secret_token: str | None = Header(default=None),
+):
+    if WEBHOOK_SECRET and x_telegram_bot_api_secret_token != WEBHOOK_SECRET:
+        raise HTTPException(401, detail="Bad webhook secret")
+
     update = await req.json()
 
+    # сообщения
     msg = update.get("message")
     if msg:
         chat_id = msg.get("chat", {}).get("id")
         text_in = (msg.get("text") or "").strip()
+        from_id = msg.get("from", {}).get("id")
 
         if text_in.startswith("/start") or text_in.startswith("/menu"):
             await tg_call("sendMessage", {
@@ -159,8 +211,29 @@ async def telegram_webhook(req: Request):
                 "text": "Нажми кнопку ниже, чтобы открыть магазин:",
                 "reply_markup": webapp_keyboard()
             })
+            return {"ok": True}
+
+        # команда /pay только в группе и только админы
+        if GROUP_CHAT_ID and chat_id == int(GROUP_CHAT_ID) and text_in.startswith("/pay"):
+            if from_id not in ADMIN_IDS:
+                await tg_call("sendMessage", {"chat_id": chat_id, "text": "⛔ Нет прав менять реквизиты."})
+                return {"ok": True}
+
+            new_text = text_in[len("/pay"):].strip()
+            if not new_text:
+                await tg_call("sendMessage", {"chat_id": chat_id, "text": "Напиши так:\n/pay\nКарта: ...\nСБП: ..."})
+                return {"ok": True}
+
+            session = await get_session()
+            async with session:
+                await set_payment_text(session, new_text)
+
+            await tg_call("sendMessage", {"chat_id": chat_id, "text": "✅ Реквизиты сохранены."})
+            return {"ok": True}
+
         return {"ok": True}
 
+    # callback
     cb = update.get("callback_query")
     if not cb:
         return {"ok": True}
@@ -187,15 +260,33 @@ async def telegram_webhook(req: Request):
                 return {"ok": True}
 
             accepter = f"@{from_user.get('username')}" if from_user.get("username") else (from_user.get("first_name") or "Пользователь")
+            payment_text = await get_payment_text(session)
+
             order.accepted = True
             order.accepted_by = accepter
             await session.commit()
 
-        await tg_call("sendMessage", {
-            "chat_id": GROUP_CHAT_ID,
-            "text": f"✅ Заказ {order_id} принят: {accepter}"
-        })
+        # если реквизиты не заданы
+        if not payment_text:
+            await tg_call("sendMessage", {
+                "chat_id": GROUP_CHAT_ID,
+                "text": f"⚠️ Заказ {order_id} принят: {accepter}\nНо реквизиты не заданы.\nАдмин: /pay <текст>"
+            })
+        else:
+            await tg_call("sendMessage", {
+                "chat_id": GROUP_CHAT_ID,
+                "text": f"✅ Заказ {order_id} принят: {accepter}\n\n💳 Реквизиты:\n{payment_text}"
+            })
+            # покупателю в личку
+            try:
+                await tg_call("sendMessage", {
+                    "chat_id": order.buyer_id,
+                    "text": f"✅ Ваш заказ {order_id} принят.\n\n💳 Реквизиты для оплаты:\n{payment_text}"
+                })
+            except Exception:
+                pass
 
+        # поменять кнопку
         if message_id:
             try:
                 await tg_call("editMessageReplyMarkup", {
