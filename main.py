@@ -4,7 +4,7 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-
+ 
 app = FastAPI()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
