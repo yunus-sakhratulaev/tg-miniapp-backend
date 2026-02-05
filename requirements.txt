@@ -1,3 +1,5 @@
 fastapi
 uvicorn[standard]
 httpx
+SQLAlchemy>=2.0
+asyncpg
