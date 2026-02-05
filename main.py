@@ -1,3 +1,4 @@
+# v1 Готовый вариант
 import os
 import uuid
 import hmac
