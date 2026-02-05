@@ -44,14 +44,14 @@ ALLOW_ORIGINS = os.getenv("ALLOW_ORIGINS", "https://ret-ashy.vercel.app").split(
 
 
 # =========================
-# DB
+# DB Models
 # =========================
 class Base(DeclarativeBase):
     pass
 
 
 class OrderStatus(str, Enum):
-    NEW = "NEW"                        # создан, отправлен в группу
+    NEW = "NEW"
     AWAITING_PAYMENT = "AWAITING_PAYMENT"
     RECEIPT_SENT = "RECEIPT_SENT"
     PAID = "PAID"
@@ -71,7 +71,7 @@ class PaymentMethod(Base):
 class Order(Base):
     __tablename__ = "orders"
 
-    id: Mapped[str] = mapped_column(String(32), primary_key=True)  # short id
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
     user_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
 
     items: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
@@ -92,10 +92,16 @@ class Order(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+# =========================
+# DB Engine (with "do not crash" behavior)
+# =========================
 engine = create_async_engine(DATABASE_URL, echo=False) if DATABASE_URL else None
 SessionLocal: Optional[async_sessionmaker[AsyncSession]] = (
     async_sessionmaker(engine, expire_on_commit=False) if engine else None
 )
+
+DB_READY = False
+DB_ERROR: str = ""
 
 
 # =========================
@@ -118,6 +124,11 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def require_db():
+    if not SessionLocal or not DB_READY:
+        raise HTTPException(status_code=503, detail=f"DB unavailable: {DB_ERROR or 'not ready'}")
+
+
 async def tg_call(method: str, payload: dict[str, Any]):
     if not BOT_TOKEN:
         raise HTTPException(500, detail="BOT_TOKEN not set")
@@ -126,32 +137,33 @@ async def tg_call(method: str, payload: dict[str, Any]):
         r = await client.post(url, json=payload)
         data = r.json()
     if not data.get("ok"):
-        raise HTTPException(500, detail=data)
+        raise HTTPException(500, detail={"telegram_error": data, "method": method})
     return data["result"]
 
 
 def verify_webapp_init_data(init_data: str) -> dict[str, str]:
     """
-    Проверка подписи Telegram WebApp initData.
+    Правильная проверка Telegram WebApp initData.
+    Ключевая вещь: parse_qsl ДЕКОДИРУЕТ значения (percent-encoding и '+').
     """
     if not BOT_TOKEN:
         raise HTTPException(500, detail="BOT_TOKEN not set (needed for initData validation)")
     if not init_data:
         raise HTTPException(401, detail="Missing initData")
 
-    pairs = [p for p in init_data.split("&") if p]
-    data_map: dict[str, str] = {}
-    for p in pairs:
-        if "=" not in p:
-            continue
-        k, v = p.split("=", 1)
-        data_map[k] = v
+    from urllib.parse import parse_qsl
+
+    # parse_qsl: декодирует URL-encoding и превращает '+' в пробел
+    pairs = parse_qsl(init_data, keep_blank_values=True)
+    data_map: dict[str, str] = dict(pairs)
 
     received_hash = data_map.pop("hash", None)
     if not received_hash:
         raise HTTPException(401, detail="Bad initData: missing hash")
 
     data_check_string = "\n".join([f"{k}={data_map[k]}" for k in sorted(data_map.keys())])
+
+    # secret_key = HMAC_SHA256("WebAppData", bot_token)
     secret_key = hmac.new(b"WebAppData", BOT_TOKEN.encode("utf-8"), hashlib.sha256).digest()
     computed_hash = hmac.new(secret_key, data_check_string.encode("utf-8"), hashlib.sha256).hexdigest()
 
@@ -165,9 +177,9 @@ def extract_user_id_from_init_data_map(data_map: dict[str, str]) -> int:
     user_raw = data_map.get("user")
     if not user_raw:
         return 0
-    import urllib.parse, json
+    import json
     try:
-        user_json = json.loads(urllib.parse.unquote(user_raw))
+        user_json = json.loads(user_raw)
         return int(user_json.get("id", 0))
     except Exception:
         return 0
@@ -230,31 +242,42 @@ class CreateOrderOut(BaseModel):
 
 
 # =========================
-# Startup
+# Startup (DO NOT CRASH)
 # =========================
 @app.on_event("startup")
 async def _startup():
-    if not engine:
-        raise RuntimeError("DATABASE_URL not set")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    global DB_READY, DB_ERROR
 
-    # если реквизитов нет — создадим 2 примера (чтобы сразу работало)
-    async with SessionLocal() as session:
-        res = await session.execute(select(PaymentMethod).where(PaymentMethod.is_active == True))
-        methods = res.scalars().all()
-        if not methods:
-            now = utcnow()
-            session.add_all([
-                PaymentMethod(title="Карта 1", text="Карта: 0000 0000 0000 0000\nПолучатель: ...", is_active=True, created_at=now),
-                PaymentMethod(title="СБП", text="СБП по номеру: +7...\nБанк: ...\nПолучатель: ...", is_active=True, created_at=now),
-            ])
-            await session.commit()
+    if not engine:
+        DB_READY = False
+        DB_ERROR = "DATABASE_URL not set"
+        return
+
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+        async with SessionLocal() as session:
+            res = await session.execute(select(PaymentMethod).where(PaymentMethod.is_active == True))
+            methods = res.scalars().all()
+            if not methods:
+                now = utcnow()
+                session.add_all([
+                    PaymentMethod(title="Карта 1", text="Карта: 0000 0000 0000 0000\nПолучатель: ...", is_active=True, created_at=now),
+                    PaymentMethod(title="СБП", text="СБП по номеру: +7...\nБанк: ...\nПолучатель: ...", is_active=True, created_at=now),
+                ])
+                await session.commit()
+
+        DB_READY = True
+        DB_ERROR = ""
+    except Exception as e:
+        DB_READY = False
+        DB_ERROR = repr(e)
 
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {"ok": True, "db_ready": DB_READY, "db_error": DB_ERROR}
 
 
 # =========================
@@ -262,10 +285,9 @@ def health():
 # =========================
 @app.post("/api/order", response_model=CreateOrderOut)
 async def create_order(payload: CreateOrderIn):
+    require_db()
     if not GROUP_CHAT_ID:
         raise HTTPException(500, detail="GROUP_CHAT_ID not set")
-    if not SessionLocal:
-        raise HTTPException(500, detail="DB not configured")
     if not payload.items:
         raise HTTPException(400, detail="Empty items")
 
@@ -328,24 +350,18 @@ async def telegram_webhook(
     if WEBHOOK_SECRET and x_telegram_bot_api_secret_token != WEBHOOK_SECRET:
         raise HTTPException(401, detail="Bad webhook secret")
 
-    update = await req.json()
-    if not SessionLocal:
-        return {"ok": True}
+    if not SessionLocal or not DB_READY:
+        return {"ok": True, "db_ready": DB_READY, "db_error": DB_ERROR}
 
-    # -------------------------
-    # Messages (commands, receipts)
-    # -------------------------
+    update = await req.json()
+
     msg = update.get("message")
     if msg:
         chat_id = msg.get("chat", {}).get("id")
         from_id = msg.get("from", {}).get("id")
         text = (msg.get("text") or "").strip()
 
-        # 1) Управление реквизитами (только в группе)
-        # /paylist — список
-        # /payadd <Название> | <Текст реквизитов>
-        # /payoff <id> — выключить
-        # /payon <id> — включить
+        # Commands in group
         if GROUP_CHAT_ID and chat_id == int(GROUP_CHAT_ID) and text:
             if text.startswith("/paylist"):
                 if from_id not in ADMIN_IDS:
@@ -372,7 +388,7 @@ async def telegram_webhook(
                 if "|" not in payload_txt:
                     await tg_call("sendMessage", {
                         "chat_id": chat_id,
-                        "text": "Формат:\n/payadd Название | Текст реквизитов\n\nПример:\n/payadd Карта Тинькофф | Карта: ....",
+                        "text": "Формат:\n/payadd Название | Текст реквизитов\n\nПример:\n/payadd Карта Т-Банк | Карта: ....",
                     })
                     return {"ok": True}
                 title, ptext = [x.strip() for x in payload_txt.split("|", 1)]
@@ -407,7 +423,7 @@ async def telegram_webhook(
                 await tg_call("sendMessage", {"chat_id": chat_id, "text": f"✅ Обновлено: {mid} → {'active' if new_state else 'inactive'}"})
                 return {"ok": True}
 
-        # 2) Пользователь прислал чек (photo/document)
+        # Receipt from user
         has_photo = bool(msg.get("photo"))
         has_doc = bool(msg.get("document"))
         if has_photo or has_doc:
@@ -457,7 +473,6 @@ async def telegram_webhook(
                         "reply_markup": keyboard,
                     })
 
-                    # Переслать чек в группу
                     try:
                         if has_photo:
                             await tg_call("sendPhoto", {"chat_id": int(GROUP_CHAT_ID), "photo": file_id, "caption": f"Чек заказ `{order.id}`"})
@@ -475,9 +490,6 @@ async def telegram_webhook(
 
         return {"ok": True}
 
-    # -------------------------
-    # Callback buttons
-    # -------------------------
     cb = update.get("callback_query")
     if not cb:
         return {"ok": True}
@@ -494,7 +506,6 @@ async def telegram_webhook(
         pass
 
     async with SessionLocal() as session:
-        # 1) "Выбрать реквизиты" -> показать список кнопок
         if data.startswith("choosepay:"):
             if not is_admin:
                 return {"ok": True}
@@ -533,11 +544,9 @@ async def telegram_webhook(
             })
             return {"ok": True}
 
-        # 2) Установить реквизит и отправить пользователю
         if data.startswith("setpay:"):
             if not is_admin:
                 return {"ok": True}
-            # setpay:<order_id>:<method_id>
             try:
                 _, order_id, mid = data.split(":", 2)
                 method_id = int(mid)
@@ -576,7 +585,6 @@ async def telegram_webhook(
             })
             return {"ok": True}
 
-        # 3) Отмена заказа
         if data.startswith("cancel:"):
             if not is_admin:
                 return {"ok": True}
@@ -594,7 +602,6 @@ async def telegram_webhook(
             await tg_call("sendMessage", {"chat_id": int(GROUP_CHAT_ID), "text": f"❌ Заказ `{order_id}` отменён.", "parse_mode": "Markdown"})
             return {"ok": True}
 
-        # 4) Подтвердить оплату
         if data.startswith("paid:"):
             if not is_admin:
                 return {"ok": True}
@@ -622,7 +629,6 @@ async def telegram_webhook(
                 pass
             return {"ok": True}
 
-        # 5) Отклонить чек
         if data.startswith("reject_receipt:"):
             if not is_admin:
                 return {"ok": True}
