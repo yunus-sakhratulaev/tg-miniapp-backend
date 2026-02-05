@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import (
     String,
     Integer,
+    BigInteger,
     DateTime,
     Text,
     JSON,
@@ -24,11 +25,8 @@ from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, Asyn
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
-# =========================
-# ENV
-# =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")  # -100...
+GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 
 ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "")
@@ -40,13 +38,9 @@ if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
 elif DATABASE_URL and DATABASE_URL.startswith("postgresql://"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
 
-# Можно оставить, но CORS сделаем безопасно
 ALLOW_ORIGINS = os.getenv("ALLOW_ORIGINS", "https://ret-ashy.vercel.app").split(",")
 
 
-# =========================
-# DB Models
-# =========================
 class Base(DeclarativeBase):
     pass
 
@@ -73,7 +67,9 @@ class Order(Base):
     __tablename__ = "orders"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    user_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+
+    # ✅ Telegram user_id может быть больше 2^31-1
+    user_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
 
     items: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     address_text: Mapped[Optional[str]] = mapped_column(Text(), nullable=True)
@@ -82,20 +78,18 @@ class Order(Base):
     total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default=OrderStatus.NEW.value)
 
+    # ✅ админы тоже лучше BIGINT (на всякий)
     payment_method_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    accepted_by: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    accepted_by: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     accepted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
     receipt_file_id: Mapped[Optional[str]] = mapped_column(Text(), nullable=True)
-    receipt_message_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    receipt_message_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
-# =========================
-# DB
-# =========================
 engine = create_async_engine(DATABASE_URL, echo=False) if DATABASE_URL else None
 SessionLocal: Optional[async_sessionmaker[AsyncSession]] = (
     async_sessionmaker(engine, expire_on_commit=False) if engine else None
@@ -104,28 +98,7 @@ SessionLocal: Optional[async_sessionmaker[AsyncSession]] = (
 DB_READY = False
 DB_ERROR: str = ""
 
-# Последняя ошибка отправки в Telegram (чтобы не лазить в логи)
-LAST_TG_ERROR: str = ""
 
-
-# =========================
-# APP
-# =========================
-app = FastAPI()
-
-# CORS максимально просто и надёжно
-app.add_middleware(
-    CORSMiddleware,
-    allow_origin_regex=".*",
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-# =========================
-# Utils
-# =========================
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -137,30 +110,14 @@ def require_db():
 
 async def tg_call(method: str, payload: dict[str, Any]):
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN not set")
+        raise HTTPException(500, detail="BOT_TOKEN not set")
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
     async with httpx.AsyncClient(timeout=25) as client:
         r = await client.post(url, json=payload)
         data = r.json()
     if not data.get("ok"):
-        raise RuntimeError(f"Telegram error ({method}): {data}")
+        raise HTTPException(500, detail={"telegram_error": data, "method": method})
     return data["result"]
-
-
-async def tg_try(method: str, payload: dict[str, Any]) -> bool:
-    """
-    Никогда не роняет запрос.
-    Возвращает True если отправилось, False если нет.
-    Ошибка сохраняется в LAST_TG_ERROR.
-    """
-    global LAST_TG_ERROR
-    try:
-        await tg_call(method, payload)
-        LAST_TG_ERROR = ""
-        return True
-    except Exception as e:
-        LAST_TG_ERROR = repr(e)
-        return False
 
 
 def verify_webapp_init_data(init_data: str) -> dict[str, str]:
@@ -230,9 +187,6 @@ def format_payment_to_user(order_id: str, payment_title: str, payment_text: str)
     )
 
 
-# =========================
-# Schemas
-# =========================
 class OrderItemIn(BaseModel):
     product_id: int
     title: str
@@ -251,13 +205,19 @@ class CreateOrderOut(BaseModel):
     ok: bool = True
     order_id: str
     total: int
-    sent_to_group: bool
-    tg_error: Optional[str] = None
 
 
-# =========================
-# Startup
-# =========================
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origin_regex=".*",
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
 @app.on_event("startup")
 async def _startup():
     global DB_READY, DB_ERROR
@@ -294,23 +254,9 @@ def health():
     return {"ok": True, "db_ready": DB_READY, "db_error": DB_ERROR}
 
 
-@app.get("/debug/last-error")
-def debug_last_error():
-    # чтобы ты мог увидеть причину 500 без логов
-    return {
-        "last_tg_error": LAST_TG_ERROR,
-        "group_chat_id": GROUP_CHAT_ID,
-        "bot_token_set": bool(BOT_TOKEN),
-    }
-
-
-# =========================
-# API
-# =========================
 @app.post("/api/order", response_model=CreateOrderOut)
 async def create_order(payload: CreateOrderIn):
     require_db()
-
     if not GROUP_CHAT_ID:
         raise HTTPException(500, detail="GROUP_CHAT_ID not set")
     if not payload.items:
@@ -347,46 +293,18 @@ async def create_order(payload: CreateOrderIn):
         session.add(order)
         await session.commit()
 
-    # ⚠️ САМОЕ ВАЖНОЕ: Telegram НЕ должен ломать создание заказа.
-    # Если отправка не удалась — заказ всё равно создан и фронт получит ok:true.
-    keyboard = {
-        "inline_keyboard": [[
-            {"text": "💳 Выбрать реквизиты", "callback_data": f"choosepay:{order_id}"},
-            {"text": "❌ Отменить", "callback_data": f"cancel:{order_id}"},
-        ]]
-    }
+        keyboard = {
+            "inline_keyboard": [[
+                {"text": "💳 Выбрать реквизиты", "callback_data": f"choosepay:{order_id}"},
+                {"text": "❌ Отменить", "callback_data": f"cancel:{order_id}"},
+            ]]
+        }
 
-    sent = await tg_try("sendMessage", {
-        "chat_id": int(GROUP_CHAT_ID),
-        "text": format_order_for_admin(order),
-        "parse_mode": "Markdown",
-        "reply_markup": keyboard,
-    })
+        await tg_call("sendMessage", {
+            "chat_id": int(GROUP_CHAT_ID),
+            "text": format_order_for_admin(order),
+            "parse_mode": "Markdown",
+            "reply_markup": keyboard,
+        })
 
-    return CreateOrderOut(
-        order_id=order_id,
-        total=total,
-        sent_to_group=sent,
-        tg_error=(LAST_TG_ERROR if not sent else None),
-    )
-
-
-# =========================
-# Telegram Webhook (оставил как есть по смыслу, без изменений логики)
-# =========================
-@app.post("/telegram/webhook")
-async def telegram_webhook(
-    req: Request,
-    x_telegram_bot_api_secret_token: str | None = Header(default=None),
-):
-    if WEBHOOK_SECRET and x_telegram_bot_api_secret_token != WEBHOOK_SECRET:
-        raise HTTPException(401, detail="Bad webhook secret")
-
-    if not SessionLocal or not DB_READY:
-        return {"ok": True, "db_ready": DB_READY, "db_error": DB_ERROR}
-
-    update = await req.json()
-
-    # дальше оставляй свою текущую логику как у тебя уже работает
-    # (у тебя /paylist, /payadd, выбор реквизитов, чек, подтверждение)
-    return {"ok": True}
+    return CreateOrderOut(order_id=order_id, total=total)
