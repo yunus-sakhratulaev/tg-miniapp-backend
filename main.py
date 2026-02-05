@@ -25,12 +25,17 @@ from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, Asyn
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
+# =========================
+# ENV
+# =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")
+GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")  # -100...
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 
 ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "")
 ADMIN_IDS = {int(x.strip()) for x in ADMIN_IDS_RAW.split(",") if x.strip().isdigit()}
+
+RESET_DB = os.getenv("RESET_DB", "0") == "1"
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
@@ -38,9 +43,10 @@ if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
 elif DATABASE_URL and DATABASE_URL.startswith("postgresql://"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
 
-ALLOW_ORIGINS = os.getenv("ALLOW_ORIGINS", "https://ret-ashy.vercel.app").split(",")
 
-
+# =========================
+# DB Models
+# =========================
 class Base(DeclarativeBase):
     pass
 
@@ -68,7 +74,7 @@ class Order(Base):
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
 
-    # ✅ Telegram user_id может быть больше 2^31-1
+    # ✅ Telegram user_id часто больше int32 -> только BIGINT
     user_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
 
     items: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
@@ -78,8 +84,9 @@ class Order(Base):
     total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default=OrderStatus.NEW.value)
 
-    # ✅ админы тоже лучше BIGINT (на всякий)
     payment_method_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+    # ✅ тоже BIGINT на всякий случай
     accepted_by: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     accepted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
@@ -90,6 +97,9 @@ class Order(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+# =========================
+# DB Engine
+# =========================
 engine = create_async_engine(DATABASE_URL, echo=False) if DATABASE_URL else None
 SessionLocal: Optional[async_sessionmaker[AsyncSession]] = (
     async_sessionmaker(engine, expire_on_commit=False) if engine else None
@@ -99,6 +109,24 @@ DB_READY = False
 DB_ERROR: str = ""
 
 
+# =========================
+# APP
+# =========================
+app = FastAPI()
+
+# CORS: чтобы Vercel+Telegram WebView не мешали
+app.add_middleware(
+    CORSMiddleware,
+    allow_origin_regex=".*",
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# =========================
+# Utils
+# =========================
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -127,7 +155,6 @@ def verify_webapp_init_data(init_data: str) -> dict[str, str]:
         raise HTTPException(401, detail="Missing initData")
 
     from urllib.parse import parse_qsl
-
     pairs = parse_qsl(init_data, keep_blank_values=True)
     data_map: dict[str, str] = dict(pairs)
 
@@ -179,14 +206,9 @@ def format_order_for_admin(order: Order) -> str:
     return "\n".join(lines)
 
 
-def format_payment_to_user(order_id: str, payment_title: str, payment_text: str) -> str:
-    return (
-        f"✅ Ваш заказ `{order_id}` принят.\n\n"
-        f"💳 *Реквизиты для оплаты ({payment_title}):*\n{payment_text}\n\n"
-        f"После оплаты отправьте сюда *фото/файл чека*."
-    )
-
-
+# =========================
+# Schemas
+# =========================
 class OrderItemIn(BaseModel):
     product_id: int
     title: str
@@ -207,17 +229,9 @@ class CreateOrderOut(BaseModel):
     total: int
 
 
-app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origin_regex=".*",
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
+# =========================
+# Startup: AUTO RESET (если RESET_DB=1)
+# =========================
 @app.on_event("startup")
 async def _startup():
     global DB_READY, DB_ERROR
@@ -229,8 +243,12 @@ async def _startup():
 
     try:
         async with engine.begin() as conn:
+            if RESET_DB:
+                # ⚠️ УДАЛЯЕТ ТАБЛИЦЫ. ДАННЫЕ ПРОПАДУТ.
+                await conn.run_sync(Base.metadata.drop_all)
             await conn.run_sync(Base.metadata.create_all)
 
+        # seed payment methods
         async with SessionLocal() as session:
             res = await session.execute(select(PaymentMethod).where(PaymentMethod.is_active == True))
             methods = res.scalars().all()
@@ -251,12 +269,16 @@ async def _startup():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "db_ready": DB_READY, "db_error": DB_ERROR}
+    return {"ok": True, "db_ready": DB_READY, "db_error": DB_ERROR, "reset_db": RESET_DB}
 
 
+# =========================
+# API
+# =========================
 @app.post("/api/order", response_model=CreateOrderOut)
 async def create_order(payload: CreateOrderIn):
     require_db()
+
     if not GROUP_CHAT_ID:
         raise HTTPException(500, detail="GROUP_CHAT_ID not set")
     if not payload.items:
@@ -300,6 +322,7 @@ async def create_order(payload: CreateOrderIn):
             ]]
         }
 
+        # Если тут упадёт — увидишь нормальную 500 (уже не из-за БД)
         await tg_call("sendMessage", {
             "chat_id": int(GROUP_CHAT_ID),
             "text": format_order_for_admin(order),
@@ -308,3 +331,16 @@ async def create_order(payload: CreateOrderIn):
         })
 
     return CreateOrderOut(order_id=order_id, total=total)
+
+
+# =========================
+# Webhook placeholder (если у тебя он в другом файле — оставь как было)
+# =========================
+@app.post("/telegram/webhook")
+async def telegram_webhook(
+    req: Request,
+    x_telegram_bot_api_secret_token: str | None = Header(default=None),
+):
+    if WEBHOOK_SECRET and x_telegram_bot_api_secret_token != WEBHOOK_SECRET:
+        raise HTTPException(401, detail="Bad webhook secret")
+    return {"ok": True}
