@@ -215,7 +215,6 @@ def format_payment_to_user(order_id: str, payment_title: str, payment_text: str)
 
 
 async def ensure_schema(conn):
-    # orders
     await conn.execute(sql_text("ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_method_id INTEGER;"))
     await conn.execute(sql_text("ALTER TABLE orders ADD COLUMN IF NOT EXISTS accepted_by BIGINT;"))
     await conn.execute(sql_text("ALTER TABLE orders ADD COLUMN IF NOT EXISTS accepted_at TIMESTAMPTZ;"))
@@ -223,13 +222,11 @@ async def ensure_schema(conn):
     await conn.execute(sql_text("ALTER TABLE orders ADD COLUMN IF NOT EXISTS receipt_kind VARCHAR(16);"))
     await conn.execute(sql_text("ALTER TABLE orders ADD COLUMN IF NOT EXISTS receipt_message_id BIGINT;"))
 
-    # payment_methods
     await conn.execute(sql_text("ALTER TABLE payment_methods ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;"))
     await conn.execute(sql_text("ALTER TABLE payment_methods ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ;"))
 
 
 async def rebuild_db(conn):
-    # ⚠️ Удаляет данные
     await conn.execute(sql_text("DROP TABLE IF EXISTS orders CASCADE;"))
     await conn.execute(sql_text("DROP TABLE IF EXISTS payment_methods CASCADE;"))
     await conn.run_sync(Base.metadata.create_all)
@@ -398,6 +395,7 @@ async def telegram_webhook(
             await tg_call("sendMessage", {"chat_id": chat_id, "text": "Открой магазин кнопкой ниже:", "reply_markup": kb})
             return {"ok": True}
 
+        # админ-команды в группе
         if GROUP_CHAT_ID and chat_id == int(GROUP_CHAT_ID) and text:
             if text.startswith("/paylist"):
                 if not is_admin(from_id):
@@ -454,7 +452,7 @@ async def telegram_webhook(
                 await tg_call("sendMessage", {"chat_id": chat_id, "text": f"✅ Обновлено: {mid} → {'active' if new_state else 'inactive'}"})
                 return {"ok": True}
 
-        # чек от пользователя
+        # чек от пользователя (в личке)
         has_photo = bool(msg.get("photo"))
         has_doc = bool(msg.get("document"))
         if has_photo or has_doc:
@@ -502,6 +500,9 @@ async def telegram_webhook(
 
         return {"ok": True}
 
+    # =========================
+    # CALLBACKS
+    # =========================
     cb = update.get("callback_query")
     if not cb:
         return {"ok": True}
@@ -606,6 +607,105 @@ async def telegram_webhook(
             except Exception as e:
                 await tg_call("sendMessage", {"chat_id": int(GROUP_CHAT_ID), "text": f"❌ setpay error: {repr(e)}"})
                 return {"ok": True}
+
+        # =========================
+        # PAYDONE: пользователь нажал "Оплатил" -> отправить чек в группу
+        # =========================
+        if data.startswith("paydone:"):
+            if not GROUP_CHAT_ID:
+                return {"ok": True}
+
+            order_id = data.split("paydone:", 1)[1].strip()
+            order = await session.get(Order, order_id)
+            if not order:
+                await tg_call("sendMessage", {"chat_id": from_id, "text": "Заказ не найден."})
+                return {"ok": True}
+
+            # только владелец заказа
+            if from_id != order.user_id:
+                return {"ok": True}
+
+            # должен быть чек
+            if not order.receipt_file_id or order.status != OrderStatus.RECEIPT_UPLOADED.value:
+                await tg_call("sendMessage", {"chat_id": from_id, "text": "Сначала отправь чек, потом нажми ✅ Оплатил."})
+                return {"ok": True}
+
+            order.status = OrderStatus.UNDER_REVIEW.value
+            order.updated_at = utcnow()
+            await session.commit()
+
+            kb = {"inline_keyboard": [[
+                {"text": "✅ Подтвердить", "callback_data": f"paid:{order.id}"},
+                {"text": "❌ Отклонить", "callback_data": f"reject:{order.id}"},
+            ]]}
+
+            # сообщение в группу
+            await tg_call("sendMessage", {
+                "chat_id": int(GROUP_CHAT_ID),
+                "text": f"🧾 *Проверка оплаты*\nЗаказ `{order.id}`\nПользователь `{order.user_id}`\nСумма: *{order.total} ₽*",
+                "parse_mode": "Markdown",
+                "reply_markup": kb,
+            })
+
+            # сам чек в группу
+            try:
+                if order.receipt_kind == "photo":
+                    await tg_call("sendPhoto", {
+                        "chat_id": int(GROUP_CHAT_ID),
+                        "photo": order.receipt_file_id,
+                        "caption": f"Чек заказа {order.id}",
+                    })
+                else:
+                    await tg_call("sendDocument", {
+                        "chat_id": int(GROUP_CHAT_ID),
+                        "document": order.receipt_file_id,
+                        "caption": f"Чек заказа {order.id}",
+                    })
+            except Exception as e:
+                await tg_call("sendMessage", {"chat_id": int(GROUP_CHAT_ID), "text": f"⚠️ Не смог отправить чек: {repr(e)}"})
+
+            await tg_call("sendMessage", {"chat_id": order.user_id, "text": f"✅ Заказ `{order.id}` отправлен на проверку.", "parse_mode": "Markdown"})
+            return {"ok": True}
+
+        # =========================
+        # PAID: админ подтвердил
+        # =========================
+        if data.startswith("paid:"):
+            if not is_admin(from_id):
+                return {"ok": True}
+
+            order_id = data.split("paid:", 1)[1].strip()
+            order = await session.get(Order, order_id)
+            if not order:
+                return {"ok": True}
+
+            order.status = OrderStatus.PAID.value
+            order.updated_at = utcnow()
+            await session.commit()
+
+            await tg_call("sendMessage", {"chat_id": int(GROUP_CHAT_ID), "text": f"✅ Оплата подтверждена по заказу `{order_id}`.", "parse_mode": "Markdown"})
+            await tg_call("sendMessage", {"chat_id": order.user_id, "text": f"🎉 Оплата по заказу `{order_id}` подтверждена! ✅", "parse_mode": "Markdown"})
+            return {"ok": True}
+
+        # =========================
+        # REJECT: админ отклонил чек
+        # =========================
+        if data.startswith("reject:"):
+            if not is_admin(from_id):
+                return {"ok": True}
+
+            order_id = data.split("reject:", 1)[1].strip()
+            order = await session.get(Order, order_id)
+            if not order:
+                return {"ok": True}
+
+            order.status = OrderStatus.REJECTED.value
+            order.updated_at = utcnow()
+            await session.commit()
+
+            await tg_call("sendMessage", {"chat_id": int(GROUP_CHAT_ID), "text": f"❌ Чек отклонён по заказу `{order_id}`.", "parse_mode": "Markdown"})
+            await tg_call("sendMessage", {"chat_id": order.user_id, "text": f"❌ Чек по заказу `{order_id}` отклонён. Пришли новый чек.", "parse_mode": "Markdown"})
+            return {"ok": True}
 
         if data.startswith("cancel:"):
             if not is_admin(from_id):
