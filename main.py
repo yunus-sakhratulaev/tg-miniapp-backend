@@ -22,7 +22,6 @@ from sqlalchemy import (
     Boolean,
     select,
     text as sql_text,
-    ForeignKey,
 )
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -278,7 +277,7 @@ app.add_middleware(
 
 
 # =========================
-# In-memory registration states (simple FSM)
+# In-memory states (simple FSM)
 # =========================
 class RegStep(str, Enum):
     NONE = "NONE"
@@ -287,7 +286,7 @@ class RegStep(str, Enum):
     BIRTH = "BIRTH"
 
 
-REG_STATE: dict[int, str] = {}  # user_id -> RegStep
+REG_STATE: dict[int, str] = {}  # user_id -> state
 REG_TEMP: dict[int, dict[str, str]] = {}  # user_id -> collected fields
 
 
@@ -322,7 +321,6 @@ def normalize_phone(raw: str) -> Optional[str]:
 
 def parse_birth_date(raw: str) -> Optional[str]:
     raw = (raw or "").strip()
-    # expected: YYYY-MM-DD
     try:
         parts = raw.split("-")
         if len(parts) != 3:
@@ -470,7 +468,7 @@ def rules_loyalty_text() -> str:
 # =========================
 # Wallet helpers
 # =========================
-async def get_or_create_wallet(session: AsyncSession, user_id: int, kind: str) -> Wallet:
+async def get_or_create_wallet(session: AsyncSession, user_id: int, kind: str):
     q = select(Wallet).where(Wallet.user_id == user_id, Wallet.kind == kind)
     res = await session.execute(q)
     w = res.scalar_one_or_none()
@@ -521,10 +519,6 @@ async def wallet_debit(session: AsyncSession, user_id: int, kind: str, amount: i
 # Referral percent and levels
 # =========================
 async def count_qualified_referrals(session: AsyncSession, referrer_id: int) -> int:
-    """
-    Qualified: referral has at least 1 paid order (we track referral_paid_orders>0)
-    AND has paid_total >= REFERRAL_TRIGGER_TOTAL.
-    """
     q = select(ReferralRelation).where(ReferralRelation.referrer_user_id == referrer_id)
     res = await session.execute(q)
     rels = res.scalars().all()
@@ -594,18 +588,14 @@ def consent_can_show(c: Consent) -> bool:
 # Referral binding: link or code
 # =========================
 def build_referral_link(token: str) -> str:
-    # deep-link: /start ref_<token>
-    # note: in Telegram it will work as t.me/<bot>?start=ref_<token>
     return f"ref_{token}"
 
 
 async def ensure_referral_assets(session: AsyncSession, user_id: int):
-    # code
     q1 = select(ReferralCode).where(ReferralCode.owner_user_id == user_id, ReferralCode.is_active == True)  # noqa: E712
     r1 = await session.execute(q1)
     code = r1.scalar_one_or_none()
     if not code:
-        # generate unique code
         while True:
             new_code = f"ROSE{uuid.uuid4().hex[:6].upper()}"
             qx = select(ReferralCode).where(ReferralCode.code == new_code)
@@ -615,7 +605,6 @@ async def ensure_referral_assets(session: AsyncSession, user_id: int):
         code = ReferralCode(owner_user_id=user_id, code=new_code, is_active=True, created_at=utcnow())
         session.add(code)
 
-    # link
     q2 = select(ReferralLink).where(ReferralLink.owner_user_id == user_id, ReferralLink.is_active == True)  # noqa: E712
     r2 = await session.execute(q2)
     link = r2.scalar_one_or_none()
@@ -634,12 +623,8 @@ async def ensure_referral_assets(session: AsyncSession, user_id: int):
 
 
 async def bind_referral(session: AsyncSession, referrer_id: int, referral_id: int, bound_by: str, bound_value: str) -> bool:
-    """
-    Bind only if referral_id not bound yet, and not self-referral.
-    """
     if referrer_id == referral_id:
         return False
-
     q = select(ReferralRelation).where(ReferralRelation.referral_user_id == referral_id)
     res = await session.execute(q)
     existing = res.scalar_one_or_none()
@@ -668,7 +653,6 @@ async def bind_referral(session: AsyncSession, referrer_id: int, referral_id: in
 # Schema helpers (ONLY from rebuild endpoint)
 # =========================
 async def ensure_schema(conn):
-    # orders additions
     await conn.execute(sql_text("ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_method_id INTEGER;"))
     await conn.execute(sql_text("ALTER TABLE orders ADD COLUMN IF NOT EXISTS accepted_by BIGINT;"))
     await conn.execute(sql_text("ALTER TABLE orders ADD COLUMN IF NOT EXISTS accepted_at TIMESTAMPTZ;"))
@@ -676,7 +660,6 @@ async def ensure_schema(conn):
     await conn.execute(sql_text("ALTER TABLE orders ADD COLUMN IF NOT EXISTS receipt_kind VARCHAR(16);"))
     await conn.execute(sql_text("ALTER TABLE orders ADD COLUMN IF NOT EXISTS receipt_message_id BIGINT;"))
 
-    # payment_methods additions
     await conn.execute(sql_text("ALTER TABLE payment_methods ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;"))
     await conn.execute(sql_text("ALTER TABLE payment_methods ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now();"))
     await conn.execute(sql_text("UPDATE payment_methods SET created_at = now() WHERE created_at IS NULL;"))
@@ -684,7 +667,6 @@ async def ensure_schema(conn):
 
 
 async def rebuild_db(conn):
-    # ⚠️ ДАННЫЕ УДАЛЯЮТСЯ
     await conn.execute(sql_text("DROP TABLE IF EXISTS withdraw_requests CASCADE;"))
     await conn.execute(sql_text("DROP TABLE IF EXISTS wallet_ledger CASCADE;"))
     await conn.execute(sql_text("DROP TABLE IF EXISTS wallets CASCADE;"))
@@ -862,7 +844,6 @@ async def telegram_webhook(
 
         # ====== /start and deep links ======
         if text.startswith("/start"):
-            # ensure user row exists
             async with SessionLocal() as session:
                 u = await session.get(User, from_id)
                 if not u:
@@ -884,7 +865,6 @@ async def telegram_webhook(
             parts = text.split(maxsplit=1)
             if len(parts) == 2:
                 payload = parts[1].strip()
-                # referral deep-link: ref_<token>
                 if payload.startswith("ref_"):
                     token = payload.replace("ref_", "", 1).strip()
                     async with SessionLocal() as session:
@@ -905,10 +885,12 @@ async def telegram_webhook(
             })
             return {"ok": True}
 
-        # ====== registration FSM ======
-        if REG_STATE.get(from_id) and chat_id == from_id:
-            step = REG_STATE.get(from_id)
-            if step == RegStep.NAME.value:
+        # ====== message states (registration + exchange + withdrawal) ======
+        if chat_id == from_id and REG_STATE.get(from_id):
+            state = REG_STATE.get(from_id)
+
+            # ---- Registration ----
+            if state == RegStep.NAME.value:
                 name = (text or "").strip()
                 if len(name) < 2:
                     await tg_call("sendMessage", {"chat_id": from_id, "text": "Введите имя и фамилию (минимум 2 символа)."})
@@ -918,7 +900,7 @@ async def telegram_webhook(
                 await tg_call("sendMessage", {"chat_id": from_id, "text": "Введите номер телефона (можно с +7...)."})
                 return {"ok": True}
 
-            if step == RegStep.PHONE.value:
+            if state == RegStep.PHONE.value:
                 phone = normalize_phone(text)
                 if not phone:
                     await tg_call("sendMessage", {"chat_id": from_id, "text": "Телефон не распознан. Пример: +79991234567"})
@@ -928,7 +910,7 @@ async def telegram_webhook(
                 await tg_call("sendMessage", {"chat_id": from_id, "text": "Введите дату рождения в формате YYYY-MM-DD (например 1998-05-21)."})
                 return {"ok": True}
 
-            if step == RegStep.BIRTH.value:
+            if state == RegStep.BIRTH.value:
                 bd = parse_birth_date(text)
                 if not bd:
                     await tg_call("sendMessage", {"chat_id": from_id, "text": "Неверный формат. Введите дату рождения как YYYY-MM-DD."})
@@ -962,7 +944,6 @@ async def telegram_webhook(
                     u.is_registered = True
                     u.updated_at = utcnow()
 
-                    # if deadline exists and still active and not granted -> grant bonus
                     if u.reg_bonus_deadline_at and (utcnow() <= u.reg_bonus_deadline_at) and (not u.reg_bonus_granted):
                         await wallet_credit(session, from_id, WalletKind.LOYALTY.value, REG_BONUS_POINTS, {"reason": "reg_bonus"})
                         u.reg_bonus_granted = True
@@ -976,7 +957,130 @@ async def telegram_webhook(
                 await tg_call("sendMessage", {"chat_id": from_id, "text": "Меню:", "reply_markup": main_menu_keyboard()})
                 return {"ok": True}
 
-        # ====== receipt handling (unchanged from your logic) ======
+            # ---- Exchange Loyalty -> Referral ----
+            if state == "EX_L2R":
+                raw = (text or "").strip()
+                if not raw.isdigit():
+                    await tg_call("sendMessage", {"chat_id": from_id, "text": "Введите число (например 200)."})
+                    return {"ok": True}
+                amount = int(raw)
+                if amount < 2 or amount % 2 != 0:
+                    await tg_call("sendMessage", {"chat_id": from_id, "text": "Введите *чётное* число ≥ 2. Курс 2:1 (например 100 → 50).", "parse_mode": "Markdown"})
+                    return {"ok": True}
+
+                credit = amount // 2
+
+                async with SessionLocal() as session:
+                    ok = await wallet_debit(session, from_id, WalletKind.LOYALTY.value, amount, {"reason": "exchange_to_referral"})
+                    if not ok:
+                        w = await get_or_create_wallet(session, from_id, WalletKind.LOYALTY.value)
+                        await session.commit()
+                        await tg_call("sendMessage", {"chat_id": from_id, "text": f"❌ Недостаточно баллов лояльности. Сейчас: {w.balance}."})
+                        return {"ok": True}
+
+                    await wallet_credit(session, from_id, WalletKind.REFERRAL.value, credit, {"reason": "exchange_from_loyalty", "spent": amount})
+                    await session.commit()
+
+                    wL = await get_or_create_wallet(session, from_id, WalletKind.LOYALTY.value)
+                    wR = await get_or_create_wallet(session, from_id, WalletKind.REFERRAL.value)
+                    await session.commit()
+
+                REG_STATE.pop(from_id, None)
+                await tg_call("sendMessage", {"chat_id": from_id, "text": f"✅ Обмен выполнен: -{amount} Лояльность → +{credit} Рефералка.\n\nБаланс:\n🎁 Лояльность: {wL.balance}\n🤝 Рефералка: {wR.balance}"})
+                return {"ok": True}
+
+            # ---- Exchange Referral -> Loyalty ----
+            if state == "EX_R2L":
+                raw = (text or "").strip()
+                if not raw.isdigit():
+                    await tg_call("sendMessage", {"chat_id": from_id, "text": "Введите число (например 200)."})
+                    return {"ok": True}
+                amount = int(raw)
+                if amount < 2 or amount % 2 != 0:
+                    await tg_call("sendMessage", {"chat_id": from_id, "text": "Введите *чётное* число ≥ 2. Курс 2:1 (например 100 → 50).", "parse_mode": "Markdown"})
+                    return {"ok": True}
+
+                credit = amount // 2
+
+                async with SessionLocal() as session:
+                    ok = await wallet_debit(session, from_id, WalletKind.REFERRAL.value, amount, {"reason": "exchange_to_loyalty"})
+                    if not ok:
+                        w = await get_or_create_wallet(session, from_id, WalletKind.REFERRAL.value)
+                        await session.commit()
+                        await tg_call("sendMessage", {"chat_id": from_id, "text": f"❌ Недостаточно реферальных баллов. Сейчас: {w.balance}."})
+                        return {"ok": True}
+
+                    await wallet_credit(session, from_id, WalletKind.LOYALTY.value, credit, {"reason": "exchange_from_referral", "spent": amount})
+                    await session.commit()
+
+                    wL = await get_or_create_wallet(session, from_id, WalletKind.LOYALTY.value)
+                    wR = await get_or_create_wallet(session, from_id, WalletKind.REFERRAL.value)
+                    await session.commit()
+
+                REG_STATE.pop(from_id, None)
+                await tg_call("sendMessage", {"chat_id": from_id, "text": f"✅ Обмен выполнен: -{amount} Рефералка → +{credit} Лояльность.\n\nБаланс:\n🎁 Лояльность: {wL.balance}\n🤝 Рефералка: {wR.balance}"})
+                return {"ok": True}
+
+            # ---- Withdrawal flow (подготовка) ----
+            if state == "WD_AMOUNT":
+                raw = (text or "").strip()
+                if not raw.isdigit():
+                    await tg_call("sendMessage", {"chat_id": from_id, "text": f"Введите сумму числом (минимум {WITHDRAW_MIN_RUB})."})
+                    return {"ok": True}
+                amount = int(raw)
+                if amount < WITHDRAW_MIN_RUB:
+                    await tg_call("sendMessage", {"chat_id": from_id, "text": f"Минимум для вывода: {WITHDRAW_MIN_RUB}. Введите другую сумму."})
+                    return {"ok": True}
+
+                REG_TEMP[from_id] = {"wd_amount": str(amount)}
+                REG_STATE[from_id] = "WD_PHONE"
+                await tg_call("sendMessage", {"chat_id": from_id, "text": "Введите номер телефона для СБП (например +79991234567)."})
+                return {"ok": True}
+
+            if state == "WD_PHONE":
+                phone = normalize_phone(text)
+                if not phone:
+                    await tg_call("sendMessage", {"chat_id": from_id, "text": "Телефон не распознан. Пример: +79991234567"})
+                    return {"ok": True}
+                REG_TEMP.setdefault(from_id, {})["wd_phone"] = phone
+                REG_STATE[from_id] = "WD_BANK"
+                await tg_call("sendMessage", {"chat_id": from_id, "text": "Введите банк (можно коротко), или напишите '-' если не хотите указывать."})
+                return {"ok": True}
+
+            if state == "WD_BANK":
+                bank = (text or "").strip()
+                if bank == "-":
+                    bank = ""
+
+                amount = int(REG_TEMP.get(from_id, {}).get("wd_amount", "0") or "0")
+                phone = REG_TEMP.get(from_id, {}).get("wd_phone", "")
+
+                async with SessionLocal() as session:
+                    wR = await get_or_create_wallet(session, from_id, WalletKind.REFERRAL.value)
+                    if wR.balance < amount:
+                        await session.commit()
+                        REG_STATE.pop(from_id, None)
+                        REG_TEMP.pop(from_id, None)
+                        await tg_call("sendMessage", {"chat_id": from_id, "text": f"❌ Недостаточно реферальных баллов. Сейчас: {wR.balance}."})
+                        return {"ok": True}
+
+                    # пока не списываем автоматически — только заявка (чтобы дальше добавить админ-подтверждение)
+                    session.add(WithdrawRequest(
+                        user_id=from_id,
+                        amount=amount,
+                        sbp_phone=phone,
+                        bank_name=(bank or None),
+                        status=WithdrawStatus.NEW.value,
+                        created_at=utcnow(),
+                    ))
+                    await session.commit()
+
+                REG_STATE.pop(from_id, None)
+                REG_TEMP.pop(from_id, None)
+                await tg_call("sendMessage", {"chat_id": from_id, "text": f"✅ Заявка на вывод создана: {amount} ₽ на СБП {phone}. Админ рассмотрит."})
+                return {"ok": True}
+
+        # ====== receipt handling ======
         has_photo = bool(msg.get("photo"))
         has_doc = bool(msg.get("document"))
         if has_photo or has_doc:
@@ -1042,13 +1146,12 @@ async def telegram_webhook(
         pass
 
     async with SessionLocal() as session:
-        # -------- profile --------
         if data == "profile:open":
             u = await session.get(User, from_id)
             if not u:
                 now = utcnow()
-                u = User(user_id=from_id, full_name=None, phone=None, birth_date=None, is_registered=False, created_at=now, updated_at=now,
-                         reg_bonus_deadline_at=None, reg_bonus_granted=False)
+                u = User(user_id=from_id, full_name=None, phone=None, birth_date=None, is_registered=False,
+                         created_at=now, updated_at=now, reg_bonus_deadline_at=None, reg_bonus_granted=False)
                 session.add(u)
                 await session.commit()
 
@@ -1076,7 +1179,16 @@ async def telegram_webhook(
             await tg_call("sendMessage", {"chat_id": from_id, "text": txt, "parse_mode": "Markdown", "reply_markup": kb})
             return {"ok": True}
 
-        # -------- open loyalty --------
+        if data == "menu:open":
+            await tg_call("sendMessage", {"chat_id": from_id, "text": "Меню:", "reply_markup": main_menu_keyboard()})
+            return {"ok": True}
+
+        if data == "reg:start":
+            REG_STATE[from_id] = RegStep.NAME.value
+            REG_TEMP[from_id] = {}
+            await tg_call("sendMessage", {"chat_id": from_id, "text": "Введите имя и фамилию:"})
+            return {"ok": True}
+
         if data == "loyalty:open":
             u = await session.get(User, from_id)
             if not u or not u.is_registered:
@@ -1085,7 +1197,6 @@ async def telegram_webhook(
 
             c = await get_consent(session, from_id, ConsentKind.LOYALTY.value)
             if c.accepted is not True and not consent_can_show(c):
-                # cooldown active
                 mins = int((c.cooldown_until - utcnow()).total_seconds() // 60) if c.cooldown_until else 60
                 await tg_call("sendMessage", {"chat_id": from_id, "text": f"Вы отклонили правила. Повторно можно через ~{mins} мин."})
                 return {"ok": True}
@@ -1122,9 +1233,6 @@ async def telegram_webhook(
             c.updated_at = utcnow()
             await session.commit()
             await tg_call("sendMessage", {"chat_id": from_id, "text": "✅ Правила лояльности приняты."})
-            # reopen
-            await tg_call("sendMessage", {"chat_id": from_id, "text": "Открываю лояльность…"})
-            # simulate click by sending menu
             await tg_call("sendMessage", {"chat_id": from_id, "text": "Меню:", "reply_markup": main_menu_keyboard()})
             return {"ok": True}
 
@@ -1137,7 +1245,6 @@ async def telegram_webhook(
             await tg_call("sendMessage", {"chat_id": from_id, "text": "Ок. Кнопка «Лояльность» будет доступна снова через 1 час."})
             return {"ok": True}
 
-        # -------- open referral --------
         if data == "ref:open":
             u = await session.get(User, from_id)
             if not u or not u.is_registered:
@@ -1159,7 +1266,6 @@ async def telegram_webhook(
                 return {"ok": True}
 
             code, link = await ensure_referral_assets(session, from_id)
-
             w = await get_or_create_wallet(session, from_id, WalletKind.REFERRAL.value)
             qcount = await count_qualified_referrals(session, from_id)
             pct = referral_percent_for_count(qcount)
@@ -1168,11 +1274,11 @@ async def telegram_webhook(
 
             txt = (
                 "🤝 *Рефералка*\n\n"
-                f"Реферальные баллы: *{w.balance}*\n"
+                f"Реферальные баллы: *{w.balance}* ₽\n"
                 f"Ваш уровень: *{pct}%* (квалифицированных рефералов: {qcount})\n\n"
                 f"Промокод: `{code.code}`\n"
                 f"Ссылка (deep-link): `t.me/<ВАШ_БОТ>?start={deep}`\n\n"
-                f"Вывод доступен от *{WITHDRAW_MIN_RUB}*.\n"
+                f"Вывод доступен от *{WITHDRAW_MIN_RUB} ₽*.\n"
             )
             kb = {"inline_keyboard": [
                 [{"text": "🔁 Обмен (Лояльность → Рефералка)", "callback_data": "ex:l2r"}],
@@ -1203,28 +1309,14 @@ async def telegram_webhook(
             await tg_call("sendMessage", {"chat_id": from_id, "text": "Ок. Кнопка «Рефералка» будет доступна снова через 1 час."})
             return {"ok": True}
 
-        # -------- menu open --------
-        if data == "menu:open":
-            await tg_call("sendMessage", {"chat_id": from_id, "text": "Меню:", "reply_markup": main_menu_keyboard()})
-            return {"ok": True}
-
-        # -------- registration start --------
-        if data == "reg:start":
-            REG_STATE[from_id] = RegStep.NAME.value
-            REG_TEMP[from_id] = {}
-            await tg_call("sendMessage", {"chat_id": from_id, "text": "Введите имя и фамилию:"})
-            return {"ok": True}
-
-        # -------- exchange flows (simple: ask amount in chat) --------
         if data == "ex:l2r":
-            # mark state in memory via temp
             REG_STATE[from_id] = "EX_L2R"
-            await tg_call("sendMessage", {"chat_id": from_id, "text": "Введите количество баллов Лояльности для обмена (спишем 2:1). Например: 200"})
+            await tg_call("sendMessage", {"chat_id": from_id, "text": "Введите количество баллов Лояльности для обмена (спишем 2:1). Например: 100"})
             return {"ok": True}
 
         if data == "ex:r2l":
             REG_STATE[from_id] = "EX_R2L"
-            await tg_call("sendMessage", {"chat_id": from_id, "text": "Введите количество реферальных баллов для обмена (спишем 2:1). Например: 200"})
+            await tg_call("sendMessage", {"chat_id": from_id, "text": "Введите количество реферальных баллов для обмена (спишем 2:1). Например: 100"})
             return {"ok": True}
 
         if data == "wd:start":
@@ -1236,7 +1328,7 @@ async def telegram_webhook(
             await tg_call("sendMessage", {"chat_id": from_id, "text": "Скоро будет ✅"})
             return {"ok": True}
 
-        # -------- choosepay / setpay / paydone / paid / reject / cancel (your existing logic) --------
+        # ----- existing admin/payment flow -----
         if data.startswith("choosepay:"):
             if not is_admin(from_id) or not GROUP_CHAT_ID:
                 return {"ok": True}
@@ -1371,13 +1463,11 @@ async def telegram_webhook(
             if not order:
                 return {"ok": True}
 
-            # mark paid
             order.status = OrderStatus.PAID.value
             order.updated_at = utcnow()
             await session.commit()
 
-            # ---------- Loyalty cashback accrual ----------
-            # total_spend: sum of PAID orders totals (simple query)
+            # Loyalty cashback
             q = select(Order).where(Order.user_id == order.user_id, Order.status == OrderStatus.PAID.value)
             res = await session.execute(q)
             paid_orders = res.scalars().all()
@@ -1386,13 +1476,11 @@ async def telegram_webhook(
             pct = loyalty_percent_for_spend(total_spend)
             cashback = max(0, int(order.total * pct / 100))
 
-            # require registration for loyalty accrual? We still can accrue but system not accessible.
             if cashback > 0:
                 await wallet_credit(session, order.user_id, WalletKind.LOYALTY.value, cashback, {"reason": "cashback", "order_id": order.id, "pct": pct})
                 await session.commit()
 
-            # ---------- Referral payouts ----------
-            # if this user is referral of someone, update progress and maybe payout
+            # Referral payout
             qrel = select(ReferralRelation).where(ReferralRelation.referral_user_id == order.user_id)
             rres = await session.execute(qrel)
             rel = rres.scalar_one_or_none()
@@ -1401,28 +1489,25 @@ async def telegram_webhook(
                 rel.referral_paid_total += int(order.total)
                 rel.updated_at = utcnow()
 
-                # if referral is qualified by spend threshold -> can generate payouts (first 3 orders only)
                 qualified = rel.referral_paid_total >= REFERRAL_TRIGGER_TOTAL
 
                 if qualified and rel.payouts_done_orders < REFERRAL_PAYOUT_ORDERS_LIMIT:
-                    # compute referrer percent based on qualified referrals count
                     qcount = await count_qualified_referrals(session, rel.referrer_user_id)
                     pct_ref = referral_percent_for_count(qcount)
                     pct_ref = min(pct_ref, REFERRAL_MAX_PERCENT)
 
                     payout = max(0, int(order.total * pct_ref / 100))
                     if payout > 0:
-                        await wallet_credit(session, rel.referrer_user_id, WalletKind.REFERRAL.value, payout, {"reason": "ref_payout", "order_id": order.id, "referral_user_id": order.user_id, "pct": pct_ref})
+                        await wallet_credit(session, rel.referrer_user_id, WalletKind.REFERRAL.value, payout,
+                                            {"reason": "ref_payout", "order_id": order.id, "referral_user_id": order.user_id, "pct": pct_ref})
                         rel.payouts_done_orders += 1
 
-                # detach after 3 paid orders (regardless of qualified or not: your rule says payout only first 3 orders;
-                # detaching after 3 makes sense)
                 if rel.referral_paid_orders >= REFERRAL_PAYOUT_ORDERS_LIMIT:
                     rel.is_detached = True
 
                 await session.commit()
 
-            # ---------- Registration bonus logic ----------
+            # Registration bonus notification
             u = await session.get(User, order.user_id)
             if not u:
                 now = utcnow()
@@ -1431,7 +1516,6 @@ async def telegram_webhook(
                 session.add(u)
                 await session.flush()
 
-            # if first paid order and user not registered and no deadline set -> set 24h window and notify
             if (not u.is_registered) and (u.reg_bonus_deadline_at is None):
                 u.reg_bonus_deadline_at = utcnow() + timedelta(hours=REG_BONUS_WINDOW_HOURS)
                 u.updated_at = utcnow()
