@@ -155,9 +155,6 @@ async def tg_call(method: str, payload: dict[str, Any]):
 
 
 def verify_webapp_init_data(init_data: str) -> dict[str, str]:
-    """
-    Telegram WebApp initData validation (HMAC SHA-256).
-    """
     if not BOT_TOKEN:
         raise HTTPException(500, detail="BOT_TOKEN not set (needed for initData validation)")
     if not init_data:
@@ -228,10 +225,9 @@ def format_payment_to_user(order_id: str, payment_title: str, payment_text: str)
 
 
 # =========================
-# Schema helpers (ONLY called from rebuild endpoint)
+# Schema helpers (ONLY from rebuild endpoint)
 # =========================
 async def ensure_schema(conn):
-    # orders
     await conn.execute(sql_text("ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_method_id INTEGER;"))
     await conn.execute(sql_text("ALTER TABLE orders ADD COLUMN IF NOT EXISTS accepted_by BIGINT;"))
     await conn.execute(sql_text("ALTER TABLE orders ADD COLUMN IF NOT EXISTS accepted_at TIMESTAMPTZ;"))
@@ -239,7 +235,6 @@ async def ensure_schema(conn):
     await conn.execute(sql_text("ALTER TABLE orders ADD COLUMN IF NOT EXISTS receipt_kind VARCHAR(16);"))
     await conn.execute(sql_text("ALTER TABLE orders ADD COLUMN IF NOT EXISTS receipt_message_id BIGINT;"))
 
-    # payment_methods
     await conn.execute(
         sql_text(
             "ALTER TABLE payment_methods "
@@ -247,7 +242,6 @@ async def ensure_schema(conn):
         )
     )
 
-    # created_at: корректно добавляем (default now, заполняем null, ставим not null)
     await conn.execute(
         sql_text(
             "ALTER TABLE payment_methods "
@@ -259,7 +253,6 @@ async def ensure_schema(conn):
 
 
 async def rebuild_db(conn):
-    # ⚠️ ДАННЫЕ УДАЛЯЮТСЯ
     await conn.execute(sql_text("DROP TABLE IF EXISTS orders CASCADE;"))
     await conn.execute(sql_text("DROP TABLE IF EXISTS payment_methods CASCADE;"))
     await conn.run_sync(Base.metadata.create_all)
@@ -291,7 +284,7 @@ async def seed_methods(session: AsyncSession):
 
 
 # =========================
-# Startup (NO schema changes here)
+# Startup (NO schema changes)
 # =========================
 @app.on_event("startup")
 async def _startup():
@@ -335,7 +328,6 @@ async def admin_rebuild_db_get(secret: str = Query(default="")):
     return {"ok": True, "rebuild": True}
 
 
-# оставляем POST алиас (вдруг где-то уже дергаешь)
 @app.post("/admin/rebuild-db")
 async def admin_rebuild_db_post(secret: str = Query(default="")):
     return await admin_rebuild_db_get(secret=secret)
@@ -671,9 +663,6 @@ async def telegram_webhook(
                 await tg_call("sendMessage", {"chat_id": GROUP_CHAT_ID, "text": f"❌ setpay error: {repr(e)}"})
                 return {"ok": True}
 
-        # =========================
-        # PAYDONE: пользователь нажал "Оплатил" -> отправить чек в группу
-        # =========================
         if data.startswith("paydone:"):
             if not GROUP_CHAT_ID:
                 return {"ok": True}
@@ -684,11 +673,9 @@ async def telegram_webhook(
                 await tg_call("sendMessage", {"chat_id": from_id, "text": "Заказ не найден."})
                 return {"ok": True}
 
-            # только владелец заказа
             if from_id != order.user_id:
                 return {"ok": True}
 
-            # должен быть чек
             if not order.receipt_file_id or order.status != OrderStatus.RECEIPT_UPLOADED.value:
                 await tg_call("sendMessage", {"chat_id": from_id, "text": "Сначала отправь чек, потом нажми ✅ Оплатил."})
                 return {"ok": True}
@@ -716,7 +703,6 @@ async def telegram_webhook(
                 },
             )
 
-            # сам чек в группу
             try:
                 if order.receipt_kind == "photo":
                     await tg_call("sendPhoto", {"chat_id": GROUP_CHAT_ID, "photo": order.receipt_file_id, "caption": f"Чек заказа {order.id}"})
@@ -728,9 +714,6 @@ async def telegram_webhook(
             await tg_call("sendMessage", {"chat_id": order.user_id, "text": f"✅ Заказ `{order.id}` отправлен на проверку.", "parse_mode": "Markdown"})
             return {"ok": True}
 
-        # =========================
-        # PAID: админ подтвердил
-        # =========================
         if data.startswith("paid:"):
             if not is_admin(from_id):
                 return {"ok": True}
@@ -748,9 +731,6 @@ async def telegram_webhook(
             await tg_call("sendMessage", {"chat_id": order.user_id, "text": f"🎉 Оплата по заказу `{order_id}` подтверждена! ✅", "parse_mode": "Markdown"})
             return {"ok": True}
 
-        # =========================
-        # REJECT: админ отклонил чек
-        # =========================
         if data.startswith("reject:"):
             if not is_admin(from_id):
                 return {"ok": True}
